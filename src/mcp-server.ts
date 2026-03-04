@@ -396,58 +396,137 @@ function buildFileContext(filePaths: string[]): { context: string; warnings: str
 /**
  * 异步调用 Codex CLI。使用 spawn（非 spawnSync）避免阻塞 Node.js 事件循环，
  * 确保 MCP Server 在 CLI 执行期间仍能响应 Antigravity 的心跳和其他请求。
+ *
+ * 四层超时策略：
+ * ① 不活跃超时（3 分钟）：进程已死且无输出 → 立即终止
+ * ② 进程心跳（60 秒）：kill(0) 探测存活性，存活则抑制不活跃超时
+ * ③ 无真实数据超时（10 分钟）：进程虽活但无任何 stdout/stderr → 判定卡死
+ *    （独立于心跳，kill(0) 无法欺骗此计时器，只有真实数据才能重置）
+ * ④ 绝对上限（30 分钟）：无条件终止（安全网）
  */
 async function callCodex(task: string, workingDir?: string): Promise<string> {
     const cwd = workingDir || process.cwd();
-    const TIMEOUT_MS = 300_000; // 5 分钟
+    const INACTIVITY_MS = 180_000;      // ① 3 分钟：进程死亡 + 无输出 → 超时
+    const HEARTBEAT_MS = 60_000;        // ② 每 60 秒检测进程存活
+    const NO_DATA_MS = 600_000;         // ③ 10 分钟无真实数据 → 超时（心跳无法重置）
+    const ABSOLUTE_MAX_MS = 1_800_000;  // ④ 30 分钟绝对上限
 
     return new Promise<string>((resolve, reject) => {
         const child = spawn(
             'codex',
             ['exec', '--skip-git-repo-check', '--full-auto', task],
-            { cwd, stdio: ['ignore', 'pipe', 'pipe'] }
+            { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env } }
         );
 
         const stdoutChunks: Buffer[] = [];
         const stderrChunks: Buffer[] = [];
         let settled = false;
+        let processAlive = true; // 心跳维护的存活状态
 
-        child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
-        child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
-
-        // 超时兜底
-        const timer = setTimeout(() => {
-            if (!settled) {
-                settled = true;
-                child.kill('SIGTERM');
-                reject(new Error(`Codex CLI timed out after ${TIMEOUT_MS / 1000}s`));
-            }
-        }, TIMEOUT_MS);
-
-        child.on('error', (err: NodeJS.ErrnoException) => {
+        function cleanup() {
+            clearTimeout(inactivityTimer);
+            clearTimeout(noDataTimer);
+            clearTimeout(absoluteTimer);
+            clearInterval(heartbeat);
+        }
+        function settle(fn: () => void) {
             if (settled) return;
             settled = true;
-            clearTimeout(timer);
-            if (err.code === 'ENOENT') {
-                reject(new Error('Codex CLI not found. Install: npm install -g @openai/codex, then: codex login'));
-            } else {
-                reject(new Error(`Codex CLI error: ${err.message}`));
+            cleanup();
+            fn();
+        }
+
+        // ——— ① 不活跃超时（进程死亡 + 无输出 → 终止）———
+        // 只由真实数据重置。心跳不重置此计时器，但如果进程还活着则抑制触发。
+        let inactivityTimer = setTimeout(onInactivityTimeout, INACTIVITY_MS);
+        function resetInactivityTimer() {
+            clearTimeout(inactivityTimer);
+            if (!settled) {
+                inactivityTimer = setTimeout(onInactivityTimeout, INACTIVITY_MS);
             }
+        }
+        function onInactivityTimeout() {
+            if (settled) return;
+            if (processAlive) {
+                // 进程还活着，只是短暂没输出，不触发超时，重新计时
+                resetInactivityTimer();
+                return;
+            }
+            // 进程已死且 3 分钟无输出 → 真的卡了
+            settle(() => {
+                child.kill('SIGTERM');
+                reject(new Error(`Codex CLI timed out: process dead and no output for ${INACTIVITY_MS / 1000}s`));
+            });
+        }
+
+        // ——— ② 进程心跳（只维护 processAlive 状态，不重置任何计时器）———
+        const heartbeat = setInterval(() => {
+            if (settled) { clearInterval(heartbeat); return; }
+            try {
+                child.kill(0);
+                processAlive = true;
+            } catch {
+                processAlive = false;
+                clearInterval(heartbeat);
+            }
+        }, HEARTBEAT_MS);
+
+        // ——— ③ 无真实数据超时（独立于心跳，只有真实 stdout/stderr 才能重置）———
+        let noDataTimer = setTimeout(onNoDataTimeout, NO_DATA_MS);
+        function resetNoDataTimer() {
+            clearTimeout(noDataTimer);
+            if (!settled) {
+                noDataTimer = setTimeout(onNoDataTimeout, NO_DATA_MS);
+            }
+        }
+        function onNoDataTimeout() {
+            settle(() => {
+                child.kill('SIGTERM');
+                reject(new Error(`Codex CLI timed out: no real output for ${NO_DATA_MS / 60000}min (process may be stuck despite being alive)`));
+            });
+        }
+
+        // ——— ④ 绝对上限 ———
+        const absoluteTimer = setTimeout(() => {
+            settle(() => {
+                child.kill('SIGTERM');
+                reject(new Error(`Codex CLI reached absolute time limit (${ABSOLUTE_MAX_MS / 60000}min)`));
+            });
+        }, ABSOLUTE_MAX_MS);
+
+        // ——— 数据事件：同时重置 ① 和 ③ ———
+        child.stdout.on('data', (chunk: Buffer) => {
+            stdoutChunks.push(chunk);
+            resetInactivityTimer();
+            resetNoDataTimer();
+        });
+        child.stderr.on('data', (chunk: Buffer) => {
+            stderrChunks.push(chunk);
+            resetInactivityTimer();
+            resetNoDataTimer();
+        });
+
+        child.on('error', (err: NodeJS.ErrnoException) => {
+            settle(() => {
+                if (err.code === 'ENOENT') {
+                    reject(new Error('Codex CLI not found. Install: npm install -g @openai/codex, then: codex login'));
+                } else {
+                    reject(new Error(`Codex CLI error: ${err.message}`));
+                }
+            });
         });
 
         child.on('close', (code: number | null) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
+            settle(() => {
+                const stdout = Buffer.concat(stdoutChunks).toString('utf8').trim();
+                const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
 
-            const stdout = Buffer.concat(stdoutChunks).toString('utf8').trim();
-            const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
-
-            if (code !== 0 && !stdout) {
-                reject(new Error(stderr || `Codex exited with code ${code}`));
-            } else {
-                resolve(stdout || '(Codex completed with no output)');
-            }
+                if (code !== 0 && !stdout) {
+                    reject(new Error(stderr || `Codex exited with code ${code}`));
+                } else {
+                    resolve(stdout || '(Codex completed with no output)');
+                }
+            });
         });
     });
 }
@@ -457,10 +536,20 @@ async function callCodex(task: string, workingDir?: string): Promise<string> {
 /**
  * 异步调用 Gemini CLI。使用 spawn（非 spawnSync）避免阻塞 Node.js 事件循环。
  * 自动去除 ANSI 转义码。
+ *
+ * 四层超时策略（与 callCodex 对称）：
+ * ① 不活跃超时（3 分钟）：进程已死且无输出 → 立即终止
+ * ② 进程心跳（60 秒）：kill(0) 探测存活性，存活则抑制不活跃超时
+ * ③ 无真实数据超时（10 分钟）：进程虽活但无任何 stdout/stderr → 判定卡死
+ *    （独立于心跳，kill(0) 无法欺骗此计时器，只有真实数据才能重置）
+ * ④ 绝对上限（30 分钟）：无条件终止（安全网）
  */
 async function callGemini(prompt: string, model?: string, workingDir?: string): Promise<string> {
     const cwd = workingDir || process.cwd();
-    const TIMEOUT_MS = 300_000; // 5 分钟
+    const INACTIVITY_MS = 180_000;      // ① 3 分钟：进程死亡 + 无输出 → 超时
+    const HEARTBEAT_MS = 60_000;        // ② 每 60 秒检测进程存活
+    const NO_DATA_MS = 600_000;         // ③ 10 分钟无真实数据 → 超时（心跳无法重置）
+    const ABSOLUTE_MAX_MS = 1_800_000;  // ④ 30 分钟绝对上限
 
     // Build args: use -p (short for --prompt) + --yolo to auto-accept any tool confirmations
     const cliArgs: string[] = ['-p', prompt, '--yolo'];
@@ -476,57 +565,125 @@ async function callGemini(prompt: string, model?: string, workingDir?: string): 
         const stdoutChunks: Buffer[] = [];
         const stderrChunks: Buffer[] = [];
         let settled = false;
+        let processAlive = true;
 
-        child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
-        child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
-
-        // 超时兜底
-        const timer = setTimeout(() => {
-            if (!settled) {
-                settled = true;
-                child.kill('SIGTERM');
-                reject(new Error(`Gemini CLI timed out after ${TIMEOUT_MS / 1000}s`));
-            }
-        }, TIMEOUT_MS);
-
-        child.on('error', (err: NodeJS.ErrnoException) => {
+        function cleanup() {
+            clearTimeout(inactivityTimer);
+            clearTimeout(noDataTimer);
+            clearTimeout(absoluteTimer);
+            clearInterval(heartbeat);
+        }
+        function settle(fn: () => void) {
             if (settled) return;
             settled = true;
-            clearTimeout(timer);
-            if (err.code === 'ENOENT') {
-                reject(new Error('Gemini CLI not found. Install: https://github.com/google-gemini/gemini-cli — then run `gemini` to log in.'));
-            } else {
-                reject(new Error(`Gemini CLI error: ${err.message}`));
+            cleanup();
+            fn();
+        }
+
+        // ——— ① 不活跃超时 ———
+        let inactivityTimer = setTimeout(onInactivityTimeout, INACTIVITY_MS);
+        function resetInactivityTimer() {
+            clearTimeout(inactivityTimer);
+            if (!settled) {
+                inactivityTimer = setTimeout(onInactivityTimeout, INACTIVITY_MS);
             }
+        }
+        function onInactivityTimeout() {
+            if (settled) return;
+            if (processAlive) {
+                resetInactivityTimer();
+                return;
+            }
+            settle(() => {
+                child.kill('SIGTERM');
+                reject(new Error(`Gemini CLI timed out: process dead and no output for ${INACTIVITY_MS / 1000}s`));
+            });
+        }
+
+        // ——— ② 进程心跳 ———
+        const heartbeat = setInterval(() => {
+            if (settled) { clearInterval(heartbeat); return; }
+            try {
+                child.kill(0);
+                processAlive = true;
+            } catch {
+                processAlive = false;
+                clearInterval(heartbeat);
+            }
+        }, HEARTBEAT_MS);
+
+        // ——— ③ 无真实数据超时 ———
+        let noDataTimer = setTimeout(onNoDataTimeout, NO_DATA_MS);
+        function resetNoDataTimer() {
+            clearTimeout(noDataTimer);
+            if (!settled) {
+                noDataTimer = setTimeout(onNoDataTimeout, NO_DATA_MS);
+            }
+        }
+        function onNoDataTimeout() {
+            settle(() => {
+                child.kill('SIGTERM');
+                reject(new Error(`Gemini CLI timed out: no real output for ${NO_DATA_MS / 60000}min (process may be stuck despite being alive)`));
+            });
+        }
+
+        // ——— ④ 绝对上限 ———
+        const absoluteTimer = setTimeout(() => {
+            settle(() => {
+                child.kill('SIGTERM');
+                reject(new Error(`Gemini CLI reached absolute time limit (${ABSOLUTE_MAX_MS / 60000}min)`));
+            });
+        }, ABSOLUTE_MAX_MS);
+
+        // ——— 数据事件：同时重置 ① 和 ③ ———
+        child.stdout.on('data', (chunk: Buffer) => {
+            stdoutChunks.push(chunk);
+            resetInactivityTimer();
+            resetNoDataTimer();
+        });
+        child.stderr.on('data', (chunk: Buffer) => {
+            stderrChunks.push(chunk);
+            resetInactivityTimer();
+            resetNoDataTimer();
+        });
+
+        child.on('error', (err: NodeJS.ErrnoException) => {
+            settle(() => {
+                if (err.code === 'ENOENT') {
+                    reject(new Error('Gemini CLI not found. Install: https://github.com/google-gemini/gemini-cli — then run `gemini` to log in.'));
+                } else {
+                    reject(new Error(`Gemini CLI error: ${err.message}`));
+                }
+            });
         });
 
         child.on('close', (code: number | null) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
+            settle(() => {
+                const stdout = Buffer.concat(stdoutChunks).toString('utf8').trim();
+                const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
 
-            const stdout = Buffer.concat(stdoutChunks).toString('utf8').trim();
-            const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
+                // Gemini CLI may write to stderr for progress; non-zero exit on hard error
+                if (code !== 0 && !stdout) {
+                    reject(new Error(stderr || `Gemini CLI exited with code ${code}`));
+                    return;
+                }
 
-            // Gemini CLI may write to stderr for progress; non-zero exit on hard error
-            if (code !== 0 && !stdout) {
-                reject(new Error(stderr || `Gemini CLI exited with code ${code}`));
-                return;
-            }
-
-            // Strip ANSI escape codes (colors, cursor movement, etc.)
-            // eslint-disable-next-line no-control-regex
-            const clean = stdout.replace(/\x1B\[[0-9;]*[a-zA-Z]|\x1B[@-_]/g, '');
-            resolve(clean || '(Gemini completed with no output)');
+                // Strip ANSI escape codes (colors, cursor movement, etc.)
+                // eslint-disable-next-line no-control-regex
+                const clean = stdout.replace(/\x1B\[[0-9;]*[a-zA-Z]|\x1B[@-_]/g, '');
+                resolve(clean || '(Gemini completed with no output)');
+            });
         });
     });
 }
+
+
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
 async function main() {
     const server = new Server(
-        { name: 'lhub', version: '0.2.0' },
+        { name: 'lhub', version: '0.2.1' },
         { capabilities: { tools: {} } }
     );
 
