@@ -1,0 +1,101 @@
+{
+  "name": "l-hub",
+  "displayName": "L-Hub",
+  "description": "MCP AI Bridge — 智能多模型路由 | Smart Multi-Model Routing for Antigravity",
+  "author": "Ready Steady Science",
+  "version": "0.2.0",
+  "license": "MIT",
+  "icon": "images/logo.png",
+  "publisher": "readysteadyscience",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/readysteadyscience/l-hub"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "*"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "l-hub.openPanel",
+        "title": "L-Hub: Open Dashboard",
+        "icon": "$(dashboard)"
+      }
+    ],
+    "configuration": {
+      "title": "L-Hub",
+      "properties": {
+        "l-hub._importantTip": {
+          "type": "string",
+          "default": "👉 请使用 Cmd+Shift+P 运行 'L-Hub: Open Dashboard' 👈",
+          "description": "💡 核心设置不在本页！L-Hub 采用高度定制的可视化配置面板。请在命令面板打开 Dashboard，以配置架构说明中的各个模型分支和 API Keys。",
+          "order": 1
+        },
+        "l-hub.defaultModel": {
+          "type": "string",
+          "default": "gpt",
+          "enum": [
+            "gpt",
+            "gemini",
+            "deepseek",
+            "glm",
+            "qwen",
+            "minimax",
+            "kimi",
+            "mistral"
+          ],
+          "description": "默认路由大模型（当用户的指令未触发其他垂直分支时，作为兜底模型使用）。",
+          "order": 2
+        },
+        "l-hub.retentionDays": {
+          "type": "number",
+          "default": 30,
+          "description": "自动清理历史记录的天数 (History Retention Days)。",
+          "order": 3
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile",
+    "build:vsix": "mkdir -p releases && npx vsce package --out releases/"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.18.1",
+    "css-loader": "^7.1.4",
+    "style-loader": "^4.0.0",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.3.3",
+    "webpack": "^5.89.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@vscode/webview-ui-toolkit": "^1.4.0",
+    "better-sqlite3": "^12.6.2",
+    "express": "^5.2.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "ws": "^8.19.0"
+  }
+}

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.vsix
+.DS_Store
+*.sqlite3
+*.log
+
+# Internal docs - not for public repo
+HANDOVER.md
+docs/HOW_TO_FEED_LINGLAN.md
+.vscode/
+
+# Local dev journal
+docs/DEVLOG.md
+
+.lhub_docs/

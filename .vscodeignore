@@ -1,0 +1,25 @@
+# Files/dirs not needed in the published extension
+.github/
+.vscode/
+.DS_Store
+*.vsix
+*.log
+*.sqlite3
+
+# Internal documentation (not for end users)
+docs/HOW_TO_FEED_LINGLAN.md
+docs/RELEASE_WORKFLOW.md
+
+# Development source (webpack bundles into dist/)
+src/
+webview/
+webpack.config.js
+tsconfig.json
+
+# Test and dev files
+**/*.test.ts
+**/*.spec.ts
+.eslintrc*
+
+.lhub_docs/
+releases/
